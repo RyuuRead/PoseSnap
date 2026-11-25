@@ -128,6 +128,11 @@ class PoseSnapSettings(bpy.types.PropertyGroup):
         description="Retarget leg IK or FK controllers and toes",
         default=True,
     )
+    use_morphs: bpy.props.BoolProperty(
+        name="Face Morphs",
+        description="Transfer facial shape keys and MorphRig sliders or mouth joystick",
+        default=True,
+    )
     hip_scale_ratio: bpy.props.FloatProperty(
         name="Hip Scale Ratio",
         description="Height ratio multiplier applied to root and torso translations",

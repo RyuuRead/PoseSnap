@@ -21,6 +21,7 @@ class RetargetOptions:
     use_arms: bool = True
     use_fingers: bool = True
     use_legs: bool = True
+    use_morphs: bool = True
     hip_scale_ratio: float = 1.0
     insert_keyframes: bool = False
     frame: int | None = None
@@ -36,6 +37,7 @@ class BoneTransform:
 class PoseSnapshot:
     armature_world: Matrix
     bones: dict[str, BoneTransform] = field(default_factory=dict)
+    morphs: dict[str, float] = field(default_factory=dict)
 
 
 def compute_rest_offset(src_rest_world: Matrix, tgt_rest_world: Matrix) -> Matrix:
@@ -198,7 +200,10 @@ def capture_armature_snapshot(src_arm: Any) -> PoseSnapshot:
         if isinstance(name_j, str) and name_j.strip() and not name_j.strip().startswith(("_dummy_", "_shadow_")):
             bones.setdefault(name_j.strip(), tf)
 
-    return PoseSnapshot(armature_world=arm_world, bones=bones)
+    from . import morph_retarget
+
+    morphs = morph_retarget.capture_armature_morphs(src_arm)
+    return PoseSnapshot(armature_world=arm_world, bones=bones, morphs=morphs)
 
 
 def _has_modified_ancestor(pbone: Any, known_arm_matrices: dict[str, Matrix]) -> bool:
@@ -807,6 +812,18 @@ def retarget_pose_from_snapshot(
                     frame,
                 )
                 stats["fingers"] += 1
+
+    if opts.use_morphs and snapshot.morphs:
+        from . import morph_retarget
+
+        morph_stats = morph_retarget.apply_morphs_to_target(
+            context,
+            target_rig,
+            snapshot.morphs,
+            insert_keyframes=opts.insert_keyframes,
+            frame=frame,
+        )
+        stats.update(morph_stats)
 
     if context is not None and hasattr(context, "view_layer"):
         context.view_layer.update()

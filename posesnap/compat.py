@@ -174,6 +174,30 @@ def insert_custom_prop_keyframe(
     )
 
 
+def insert_shape_key_keyframe(key_block: Any, frame: float) -> None:
+    """Insert a value keyframe on a ShapeKey block across Blender 4.4, 4.5, and 5.0+."""
+    shape_keys = getattr(key_block, "id_data", None)
+    if shape_keys is not None and _is_layered_action_version():
+        anim_data = shape_keys.animation_data
+        if anim_data is None:
+            anim_data = shape_keys.animation_data_create()
+        action = anim_data.action
+        if action is None:
+            action = bpy.data.actions.new(name=f"{shape_keys.name}Action")
+            anim_data.action = action
+        if anim_data.action_slot is None:
+            slot = None
+            for candidate in getattr(action, "slots", ()):
+                if getattr(candidate, "target_id_type", None) == "KEY":
+                    slot = candidate
+                    break
+            if slot is None:
+                slot = action.slots.new(id_type="KEY", name=shape_keys.name)
+            anim_data.action_slot = slot
+
+    key_block.keyframe_insert(data_path="value", frame=frame)
+
+
 def _load_icon_names() -> frozenset[str]:
     global _ICON_CACHE
     if _ICON_CACHE is not None:

@@ -1,15 +1,10 @@
-# Reference models and poses excluded from repository
 *.txt
 *.vpd
 MikuMikuRig/
-
-# Python bytecode and caches
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
-# Blender backups and packaged archives
 *.blend1
 *.zip
 .DS_Store

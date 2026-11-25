@@ -43,6 +43,7 @@ def _has_any_filter(settings: Any) -> bool:
         or settings.use_arms
         or settings.use_fingers
         or settings.use_legs
+        or getattr(settings, "use_morphs", True)
     )
 
 
@@ -60,6 +61,7 @@ def _build_retarget_options(
         use_arms=bool(settings.use_arms),
         use_fingers=bool(settings.use_fingers),
         use_legs=bool(settings.use_legs),
+        use_morphs=bool(getattr(settings, "use_morphs", True)),
         hip_scale_ratio=float(settings.hip_scale_ratio),
         insert_keyframes=insert_keyframes,
         frame=frame,
@@ -295,6 +297,130 @@ class POSESNAP_OT_import_vpd(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class POSESNAP_OT_import_vmd(bpy.types.Operator):
+    """Import a .vmd motion file directly onto Target MMR"""
+
+    bl_idname = "posesnap.import_vmd"
+    bl_label = "Import .vmd Motion to MMR..."
+    bl_description = "Parse a Vocaloid Motion Data (.vmd) file and bake bone and facial keyframes directly onto Target MMR"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: bpy.props.StringProperty(
+        name="VMD File Path",
+        description="Path to the .vmd motion file to import",
+        subtype="FILE_PATH",
+    )
+    filter_glob: bpy.props.StringProperty(
+        default="*.vmd",
+        options={"HIDDEN"},
+    )
+    frame_offset: bpy.props.IntProperty(
+        name="Frame Offset",
+        description="Blender frame added to VMD frame numbers (1 maps VMD frame 0 to frame 1)",
+        default=1,
+        min=-10000,
+        max=100000,
+    )
+    frame_step: bpy.props.IntProperty(
+        name="Frame Step",
+        description="Sample every N frames from the VMD timeline",
+        default=1,
+        min=1,
+        max=10,
+    )
+    set_timeline_range: bpy.props.BoolProperty(
+        name="Set Timeline Range",
+        description="Update scene Start and End frames to match the imported VMD range",
+        default=True,
+    )
+    bake_all_frames: bpy.props.BoolProperty(
+        name="Bake Every Frame",
+        description="Keyframe every frame instead of preserving only original VMD keyframes",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene = getattr(context, "scene", None) if context is not None else None
+        settings = getattr(scene, "posesnap", None) if scene is not None else None
+        if settings is None:
+            return False
+        return _is_valid_armature(settings.target_rig) and _has_any_filter(settings)
+
+    def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
+        scene = getattr(context, "scene", None)
+        settings = getattr(scene, "posesnap", None) if scene is not None else None
+        if settings is not None:
+            self.frame_step = max(1, int(settings.frame_step))
+        if not self.filepath:
+            context.window_manager.fileselect_add(self)
+            return {"RUNNING_MODAL"}
+        return self.execute(context)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import math_retarget, vmd_parser
+
+        settings = context.scene.posesnap
+        if not _is_valid_armature(settings.target_rig):
+            msg = "Select a Target MMR rig before importing a .vmd motion."
+            settings.last_status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        if not _has_any_filter(settings):
+            msg = "Enable at least one body or morph filter before importing a .vmd motion."
+            settings.last_status = msg
+            self.report({"WARNING"}, msg)
+            return {"CANCELLED"}
+
+        if not self.filepath:
+            msg = "No .vmd file path provided."
+            settings.last_status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        vpd_scale = _get_addon_vpd_scale(context)
+        options = _build_retarget_options(
+            settings,
+            math_retarget,
+            insert_keyframes=True,
+            frame=None,
+        )
+
+        try:
+            stats = vmd_parser.apply_vmd_to_mmr(
+                context,
+                self.filepath,
+                settings.target_rig,
+                options,
+                scale=vpd_scale,
+                frame_offset=int(self.frame_offset),
+                frame_step=int(self.frame_step),
+                set_timeline_range=bool(self.set_timeline_range),
+                bake_all_frames=bool(self.bake_all_frames),
+            )
+        except OSError as exc:
+            msg = f"Failed to read .vmd file: {exc}"
+            settings.last_status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+        except ValueError as exc:
+            msg = f"Invalid .vmd data: {exc}"
+            settings.last_status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        frames_baked = int(stats.get("frames_baked", 0))
+        bones_posed = int(stats.get("bones_posed", 0))
+        morphs_total = int(stats.get("morphs_driven", 0)) + int(stats.get("morphs_direct", 0))
+        filename = os.path.basename(self.filepath)
+        morph_note = f", {morphs_total} morphs" if morphs_total > 0 else ""
+        msg = f"Imported {filename} ({frames_baked} frames, {bones_posed} bones{morph_note}) to {settings.target_rig.name}."
+        settings.last_status = msg
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
 class POSESNAP_OT_bake_animation(bpy.types.Operator):
     """Bake Source MMD animation across a frame range onto Target MMR"""
 
@@ -408,7 +534,7 @@ class POSESNAP_PT_main(bpy.types.Panel):
             )
         elif not has_src:
             box1.label(
-                text="No Source MMD set: .vpd import to Target MMR is ready.",
+                text="No Source MMD set: .vpd / .vmd import to Target MMR is ready.",
                 icon=compat.safe_icon("INFO"),
             )
         else:
@@ -447,6 +573,7 @@ class POSESNAP_PT_main(bpy.types.Panel):
         filters_grid.prop(settings, "use_arms")
         filters_grid.prop(settings, "use_fingers")
         filters_grid.prop(settings, "use_legs")
+        filters_grid.prop(settings, "use_morphs")
 
         if not any_filter:
             box2.label(
@@ -496,7 +623,7 @@ class POSESNAP_PT_main(bpy.types.Panel):
             )
 
         box4 = layout.box()
-        box4.label(text="Animation Range Baker", icon=compat.safe_icon("RENDER_ANIMATION"))
+        box4.label(text="Animation & Direct VMD Transfer", icon=compat.safe_icon("RENDER_ANIMATION"))
         range_row = box4.row(align=True)
         range_row.prop(settings, "frame_start", text="Start")
         range_row.prop(settings, "frame_end", text="End")
@@ -516,6 +643,18 @@ class POSESNAP_PT_main(bpy.types.Panel):
             icon=compat.safe_icon("KEYFRAME_HLT"),
         )
 
+        vmd_col = box4.column(align=True)
+        vmd_col.enabled = has_tgt and any_filter
+        vmd_col.operator(
+            "posesnap.import_vmd",
+            icon=compat.safe_icon("IMPORT", "FILE_FOLDER"),
+        )
+        if not has_tgt:
+            box4.label(
+                text="Select a Target MMR rig to enable .vmd motion import.",
+                icon=compat.safe_icon("INFO"),
+            )
+
         if settings.last_status:
             status_box = layout.box()
             status_box.label(
@@ -529,6 +668,7 @@ CLASSES = (
     POSESNAP_OT_calibrate_height,
     POSESNAP_OT_snap_pose,
     POSESNAP_OT_import_vpd,
+    POSESNAP_OT_import_vmd,
     POSESNAP_OT_bake_animation,
     POSESNAP_PT_main,
 )

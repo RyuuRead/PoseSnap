@@ -635,7 +635,8 @@ def build_virtual_snapshot_from_vpd(
         if norm:
             snapshot_bones.setdefault(norm, tf)
 
-    return PoseSnapshot(armature_world=arm_world, bones=snapshot_bones)
+    morphs = {name: float(entry.weight) for name, entry in vpd_data.morphs.items()}
+    return PoseSnapshot(armature_world=arm_world, bones=snapshot_bones, morphs=morphs)
 
 
 def apply_vpd_to_mmr(

@@ -490,10 +490,10 @@ class TestStartupAndRegistration(unittest.TestCase):
         self.assertTrue(hasattr(bpy.types, "POSESNAP_PT_main"))
         for op in ("POSESNAP_OT_auto_detect_rigs", "POSESNAP_OT_auto_calibrate_height",
                    "POSESNAP_OT_snap_pose", "POSESNAP_OT_import_vpd",
-                   "POSESNAP_OT_bake_animation"):
+                   "POSESNAP_OT_import_vmd", "POSESNAP_OT_bake_animation"):
             self.assertTrue(hasattr(bpy.types, op), op)
         for idname in ("auto_detect_rigs", "auto_calibrate_height", "snap_pose", "import_vpd",
-                       "bake_animation"):
+                       "import_vmd", "bake_animation"):
             getattr(bpy.ops.posesnap, idname).get_rna_type()
         self.assertTrue(hasattr(bpy.types.Scene, "posesnap"))
         self.assertEqual(bpy.context.scene.posesnap.arms_mode, "IK")
@@ -915,6 +915,405 @@ class TestVpdApply(unittest.TestCase):
             self.assertTrue(self._moved(rest, "torso"))
 
 
+class TestMorphRigIntegration(unittest.TestCase):
+    def setUp(self):
+        clear_scene_objects()
+        self.rig = build_mmr_rig("RIG-MMR-FaceTest")
+        self._add_morphrig_bones(self.rig)
+        self.face_mesh = self._build_face_mesh("Face_Mesh", self.rig)
+        bpy.context.view_layer.update()
+
+    def tearDown(self):
+        bpy.context.scene.tool_settings.use_keyframe_insert_auto = False
+        clear_scene_objects()
+
+    @staticmethod
+    def _add_morphrig_bones(arm_obj):
+        bpy.context.view_layer.objects.active = arm_obj
+        bpy.ops.object.mode_set(mode="EDIT")
+        eb = arm_obj.data.edit_bones
+        for name, x_pos in (
+            ("Fader_Blink", 0.30),
+            ("Fader_Vowel_A", 0.45),
+            ("Fader_Vowel_UIEO", 0.60),
+        ):
+            bone = eb.new(name)
+            bone.head = Vector((x_pos, 0.0, 1.40))
+            bone.tail = Vector((x_pos, 0.0, 1.44))
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+        def _limit(pbone, min_xyz, max_xyz):
+            con = pbone.constraints.new("LIMIT_LOCATION")
+            con.owner_space = "LOCAL"
+            con.use_min_x = con.use_max_x = True
+            con.use_min_y = con.use_max_y = True
+            con.use_min_z = con.use_max_z = True
+            con.min_x, con.min_y, con.min_z = min_xyz
+            con.max_x, con.max_y, con.max_z = max_xyz
+
+        _limit(arm_obj.pose.bones["Fader_Blink"], (0.0, 0.0, 0.0), (0.0, 0.10, 0.0))
+        _limit(arm_obj.pose.bones["Fader_Vowel_A"], (0.0, 0.0, 0.0), (0.08, 0.0, 0.0))
+        _limit(arm_obj.pose.bones["Fader_Vowel_UIEO"], (-0.04, -0.04, 0.0), (0.04, 0.04, 0.0))
+
+    @staticmethod
+    def _build_face_mesh(name, arm_obj):
+        mesh_data = bpy.data.meshes.new(name)
+        mesh_data.from_pydata([(0.0, 0.0, 0.0), (0.1, 0.0, 0.0), (0.0, 0.1, 0.0)], [], [(0, 1, 2)])
+        mesh_obj = bpy.data.objects.new(name, mesh_data)
+        bpy.context.scene.collection.objects.link(mesh_obj)
+        mod = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+        mod.object = arm_obj
+
+        mesh_obj.shape_key_add(name="Basis")
+        for sk_name in ("まばたき", "あ", "い", "う", "え", "お", "ウィンク"):
+            mesh_obj.shape_key_add(name=sk_name)
+        return mesh_obj
+
+    @staticmethod
+    def _bind_morphrig_driver(mesh_obj, sk_name, arm_obj, bone_name, travel, axis="LOC_Y", direction=1.0):
+        kb = mesh_obj.data.shape_keys.key_blocks[sk_name]
+        fcurve = kb.driver_add("value")
+        driver = fcurve.driver
+        driver.type = "AVERAGE"
+        var = driver.variables.new()
+        var.name = "val"
+        var.type = "TRANSFORMS"
+        tgt = var.targets[0]
+        tgt.id = arm_obj
+        tgt.bone_target = bone_name
+        tgt.transform_type = axis
+        tgt.transform_space = "LOCAL_SPACE"
+
+        while fcurve.modifiers:
+            fcurve.modifiers.remove(fcurve.modifiers[0])
+        while fcurve.keyframe_points:
+            fcurve.keyframe_points.remove(fcurve.keyframe_points[0])
+        gen = fcurve.modifiers.new(type="GENERATOR")
+        gen.mode = "POLYNOMIAL"
+        gen.poly_order = 1
+        gen.coefficients[0] = 0.0
+        gen.coefficients[1] = float(direction) / float(travel)
+        fcurve.update()
+
+    def _bind_all_morphrig_drivers(self):
+        self._bind_morphrig_driver(self.face_mesh, "まばたき", self.rig, "Fader_Blink", 0.10, "LOC_Y", 1.0)
+        self._bind_morphrig_driver(self.face_mesh, "あ", self.rig, "Fader_Vowel_A", 0.08, "LOC_X", 1.0)
+        self._bind_morphrig_driver(self.face_mesh, "い", self.rig, "Fader_Vowel_UIEO", 0.04, "LOC_X", 1.0)
+        self._bind_morphrig_driver(self.face_mesh, "う", self.rig, "Fader_Vowel_UIEO", 0.04, "LOC_X", -1.0)
+        self._bind_morphrig_driver(self.face_mesh, "お", self.rig, "Fader_Vowel_UIEO", 0.04, "LOC_Y", 1.0)
+        self._bind_morphrig_driver(self.face_mesh, "え", self.rig, "Fader_Vowel_UIEO", 0.04, "LOC_Y", -1.0)
+
+    def test_vpd_drives_morphrig_sliders_and_2d_joystick(self):
+        self._bind_all_morphrig_drivers()
+        vpd_text = (
+            "Vocaloid Pose Data file\n\n"
+            "sample.osm;\n"
+            "1;\n\n"
+            "Bone0{センター\n"
+            "  0.000000,0.000000,0.000000;\n"
+            "  0.000000,0.000000,0.000000,1.000000;\n"
+            "}\n\n"
+            "Morph0{まばたき\n  0.75;\n}\n"
+            "Morph1{あ\n  0.50;\n}\n"
+            "Morph2{い\n  0.80;\n}\n"
+            "Morph3{お\n  0.60;\n}\n"
+            "Morph4{ウィンク\n  0.40;\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            vpd_path = Path(tmp) / "facial.vpd"
+            vpd_path.write_bytes(vpd_text.encode("cp932"))
+            bpy.context.scene.tool_settings.use_keyframe_insert_auto = True
+            stats = vpd_parser.apply_vpd_to_mmr(
+                bpy.context,
+                str(vpd_path),
+                self.rig,
+                math_retarget.RetargetOptions(frame=5),
+            )
+            self.assertEqual(stats.get("morphs_driven"), 4)
+            self.assertEqual(stats.get("morphs_direct"), 1)
+            self.assertEqual(stats.get("morph_bones"), 3)
+
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.075, places=5)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_A"].location.x, 0.04, places=5)
+        joy = self.rig.pose.bones["Fader_Vowel_UIEO"]
+        self.assertAlmostEqual(joy.location.x, 0.032, places=5)
+        self.assertAlmostEqual(joy.location.y, 0.024, places=5)
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["ウィンク"].value, 0.40, places=5)
+
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        eval_sk = self.face_mesh.evaluated_get(depsgraph).data.shape_keys.key_blocks
+        self.assertAlmostEqual(eval_sk["まばたき"].value, 0.75, places=4)
+        self.assertAlmostEqual(eval_sk["あ"].value, 0.50, places=4)
+        self.assertAlmostEqual(eval_sk["い"].value, 0.80, places=4)
+        self.assertAlmostEqual(eval_sk["お"].value, 0.60, places=4)
+
+        action = self.rig.animation_data.action
+        fcurves = compat.get_action_fcurves(action, getattr(self.rig.animation_data, "action_slot", None))
+        paths = {fc.data_path for fc in fcurves}
+        self.assertIn('pose.bones["Fader_Blink"].location', paths)
+        self.assertIn('pose.bones["Fader_Vowel_UIEO"].location', paths)
+
+        sk_anim = self.face_mesh.data.shape_keys.animation_data
+        sk_fcurves = compat.get_action_fcurves(sk_anim.action, getattr(sk_anim, "action_slot", None))
+        sk_paths = {fc.data_path for fc in sk_fcurves}
+        self.assertIn('key_blocks["ウィンク"].value', sk_paths)
+        self.assertNotIn('key_blocks["まばたき"].value', sk_paths)
+        self.assertNotIn('key_blocks["い"].value', sk_paths)
+
+    def test_vmd_bake_morphrig_and_negative_joystick_quadrant(self):
+        self._bind_all_morphrig_drivers()
+        src_arm = build_mmd_armature("MMD_Source_Morph")
+        src_mesh = self._build_face_mesh("MMD_Face_Mesh", src_arm)
+        src_kbs = src_mesh.data.shape_keys.key_blocks
+
+        # Frame 1: う=0.5, え=0.75; Frame 2: い=0.8, う=0.3 (opposing poles -> +0.5*half).
+        frame_values = {
+            1: {"まばたき": 0.25, "い": 0.0, "う": 0.50, "お": 0.0, "え": 0.75, "ウィンク": 0.20},
+            2: {"まばたき": 0.90, "い": 0.80, "う": 0.30, "お": 0.40, "え": 0.0, "ウィンク": 0.60},
+        }
+        for frame, values in frame_values.items():
+            for name, val in values.items():
+                src_kbs[name].value = val
+                compat.insert_shape_key_keyframe(src_kbs[name], frame=frame)
+
+        math_retarget.bake_armature_range(
+            bpy.context,
+            src_arm,
+            self.rig,
+            math_retarget.RetargetOptions(),
+            frame_start=1,
+            frame_end=2,
+            frame_step=1,
+        )
+
+        bpy.context.scene.frame_set(1)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.025, places=5)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.x, -0.02, places=5)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.y, -0.03, places=5)
+
+        bpy.context.scene.frame_set(2)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.09, places=5)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.x, 0.02, places=5)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.y, 0.016, places=5)
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["ウィンク"].value, 0.60, places=5)
+
+    def test_without_morphrig_drivers_falls_back_cleanly(self):
+        vpd_text = (
+            "Vocaloid Pose Data file\n\n"
+            "sample.osm;\n"
+            "0;\n\n"
+            "Morph0{まばたき\n  0.65;\n}\n"
+            "Morph1{い\n  0.45;\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            vpd_path = Path(tmp) / "plain.vpd"
+            vpd_path.write_bytes(vpd_text.encode("utf-8"))
+            stats = vpd_parser.apply_vpd_to_mmr(bpy.context, str(vpd_path), self.rig)
+            self.assertEqual(stats.get("morphs_driven"), 0)
+            self.assertEqual(stats.get("morphs_direct"), 2)
+
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["まばたき"].value, 0.65, places=5)
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["い"].value, 0.45, places=5)
+
+
+class TestVmdImport(unittest.TestCase):
+    def setUp(self):
+        clear_scene_objects()
+        self.rig = build_mmr_rig("RIG-MMR-VmdTest")
+        TestMorphRigIntegration._add_morphrig_bones(self.rig)
+        self.face_mesh = TestMorphRigIntegration._build_face_mesh("Face_Vmd", self.rig)
+        TestMorphRigIntegration._bind_morphrig_driver(
+            self.face_mesh, "まばたき", self.rig, "Fader_Blink", 0.10, "LOC_Y", 1.0
+        )
+        TestMorphRigIntegration._bind_morphrig_driver(
+            self.face_mesh, "い", self.rig, "Fader_Vowel_UIEO", 0.04, "LOC_X", 1.0
+        )
+        TestMorphRigIntegration._bind_morphrig_driver(
+            self.face_mesh, "お", self.rig, "Fader_Vowel_UIEO", 0.04, "LOC_Y", 1.0
+        )
+        bpy.context.view_layer.update()
+
+    def tearDown(self):
+        clear_scene_objects()
+
+    @staticmethod
+    def _build_vmd_bytes(bone_keys, morph_keys, model_name="TestModel", version=2):
+        import struct
+
+        magic = b"Vocaloid Motion Data 0002" if version == 2 else b"Vocaloid Motion Data file"
+        name_len = 20 if version == 2 else 10
+        out = bytearray(magic.ljust(30, b"\x00"))
+        out.extend(model_name.encode("cp932")[:name_len].ljust(name_len, b"\x00"))
+
+        out.extend(struct.pack("<I", len(bone_keys)))
+        linear_interp = bytes([20, 20, 20, 20, 20, 20, 20, 20, 107, 107, 107, 107, 107, 107, 107, 107] * 4)
+        for bname, frame, loc, rot in bone_keys:
+            raw_b = bname.encode("cp932")[:15].ljust(15, b"\x00")
+            out.extend(struct.pack("<15sI3f4f", raw_b, frame, *loc, *rot))
+            out.extend(linear_interp)
+
+        out.extend(struct.pack("<I", len(morph_keys)))
+        for mname, frame, weight in morph_keys:
+            raw_m = mname.encode("cp932")[:15].ljust(15, b"\x00")
+            out.extend(struct.pack("<15sIf", raw_m, frame, float(weight)))
+        return bytes(out)
+
+    def test_vmd_parse_and_direct_operator_import(self):
+        from posesnap import vmd_parser
+
+        q_id = (0.0, 0.0, 0.0, 1.0)
+        q_arm = (0.0, 0.0, math.sin(math.radians(20)), math.cos(math.radians(20)))
+        vmd_bytes = self._build_vmd_bytes(
+            bone_keys=[
+                ("センター", 0, (0.0, 0.0, 0.0), q_id),
+                ("センター", 4, (0.0, 2.0, 0.0), q_id),
+                ("左腕", 0, (0.0, 0.0, 0.0), q_id),
+                ("左腕", 4, (0.0, 0.0, 0.0), q_arm),
+            ],
+            morph_keys=[
+                ("まばたき", 0, 0.0),
+                ("まばたき", 4, 0.8),
+                ("い", 0, 0.0),
+                ("い", 4, 0.5),
+                ("お", 0, 0.0),
+                ("お", 4, 1.0),
+                ("ウィンク", 0, 0.0),
+                ("ウィンク", 4, 0.6),
+            ],
+        )
+
+        parsed = vmd_parser.parse_vmd_bytes(vmd_bytes, "memory.vmd")
+        self.assertEqual(parsed.version, 2)
+        self.assertEqual(parsed.frame_min, 0)
+        self.assertEqual(parsed.frame_max, 4)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            vmd_path = Path(tmp) / "motion.vmd"
+            vmd_path.write_bytes(vmd_bytes)
+            st = set_settings(None, self.rig, "FK", "IK")
+            before = (len(bpy.data.objects), len(bpy.data.armatures), len(bpy.data.meshes))
+            res = bpy.ops.posesnap.import_vmd(
+                filepath=str(vmd_path),
+                frame_offset=1,
+                frame_step=2,
+                set_timeline_range=True,
+            )
+            self.assertEqual(res, {"FINISHED"}, st.last_status)
+            after = (len(bpy.data.objects), len(bpy.data.armatures), len(bpy.data.meshes))
+            self.assertEqual(before, after, "VMD import left temporary data behind")
+
+        self.assertEqual(bpy.context.scene.frame_start, 1)
+        self.assertEqual(bpy.context.scene.frame_end, 5)
+
+        bpy.context.scene.frame_set(3)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.04, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.x, 0.01, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.y, 0.02, places=4)
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["ウィンク"].value, 0.3, places=4)
+
+        bpy.context.scene.frame_set(5)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.08, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.x, 0.02, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.y, 0.04, places=4)
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["ウィンク"].value, 0.6, places=4)
+
+        # Verify sparse keyframes: only frames 1 and 5 (no dense intermediate clutter).
+        action = self.rig.animation_data.action
+        fcurves = compat.get_action_fcurves(action, getattr(self.rig.animation_data, "action_slot", None))
+        blink_fc = next(fc for fc in fcurves if fc.data_path == 'pose.bones["Fader_Blink"].location' and fc.array_index == 1)
+        self.assertEqual([int(round(kp.co.x)) for kp in blink_fc.keyframe_points], [1, 5])
+        self.assertTrue(all(kp.interpolation == "LINEAR" for kp in blink_fc.keyframe_points))
+
+    def test_vmd_invalid_header_raises(self):
+        from posesnap import vmd_parser
+
+        with self.assertRaises(ValueError):
+            vmd_parser.parse_vmd_bytes(b"Not a VMD file" * 5)
+
+    def test_vmd_morph_only_with_standalone_morphrig_board(self):
+        # Mesh is deformed by a separate MMD armature, while standalone Face & Mouth boards drive its shape keys.
+        deform_arm = build_mmd_armature("Deform_MMD")
+        face_board = bpy.data.objects.new("MorphRig_Board_Face", bpy.data.armatures.new("BoardData"))
+        mouth_board = bpy.data.objects.new("MorphRig_Mouth_Face", bpy.data.armatures.new("MouthData"))
+        bpy.context.scene.collection.objects.link(face_board)
+        bpy.context.scene.collection.objects.link(mouth_board)
+        TestMorphRigIntegration._add_morphrig_bones(face_board)
+        TestMorphRigIntegration._add_morphrig_bones(mouth_board)
+
+        char_mesh = TestMorphRigIntegration._build_face_mesh("Char_Mesh", deform_arm)
+        TestMorphRigIntegration._bind_morphrig_driver(
+            char_mesh, "まばたき", face_board, "Fader_Blink", 0.10, "LOC_Y", 1.0
+        )
+        TestMorphRigIntegration._bind_morphrig_driver(
+            char_mesh, "い", mouth_board, "Fader_Vowel_UIEO", 0.04, "LOC_X", 1.0
+        )
+        TestMorphRigIntegration._bind_morphrig_driver(
+            char_mesh, "え", mouth_board, "Fader_Vowel_UIEO", 0.04, "LOC_Y", -1.0
+        )
+        bpy.context.view_layer.update()
+
+        vmd_bytes = self._build_vmd_bytes(
+            bone_keys=[],
+            morph_keys=[
+                ("まばたき", 0, 0.0),
+                ("まばたき", 2, 0.9),
+                ("い", 0, 0.0),
+                ("い", 2, 0.75),
+                ("え", 0, 0.0),
+                ("え", 2, 0.50),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            vmd_path = Path(tmp) / "facial_only.vmd"
+            vmd_path.write_bytes(vmd_bytes)
+            st = set_settings(deform_arm, face_board, "IK", "IK")
+            res = bpy.ops.posesnap.import_vmd(filepath=str(vmd_path), frame_offset=1, frame_step=1)
+            self.assertEqual(res, {"FINISHED"}, st.last_status)
+
+        bpy.context.scene.frame_set(3)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(face_board.pose.bones["Fader_Blink"].location.y, 0.09, places=4)
+        self.assertAlmostEqual(mouth_board.pose.bones["Fader_Vowel_UIEO"].location.x, 0.03, places=4)
+        self.assertAlmostEqual(mouth_board.pose.bones["Fader_Vowel_UIEO"].location.y, -0.02, places=4)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        eval_sk = char_mesh.evaluated_get(depsgraph).data.shape_keys.key_blocks
+        self.assertAlmostEqual(eval_sk["まばたき"].value, 0.9, places=4)
+        self.assertAlmostEqual(eval_sk["い"].value, 0.75, places=4)
+        self.assertAlmostEqual(eval_sk["え"].value, 0.50, places=4)
+
+    def test_vmd_morph_only_with_constrained_deform_arm_preserves_body_pose(self):
+        # Target MMR rig constrains a separate deform armature whose mesh holds driven shape keys.
+        deform_arm = build_mmd_armature("Deform_Constrained")
+        con = deform_arm.pose.bones["センター"].constraints.new("COPY_TRANSFORMS")
+        con.target = self.rig
+        con.subtarget = "torso"
+
+        # Replace default face_mesh modifier to point to deform_arm instead of self.rig.
+        self.face_mesh.modifiers["Armature"].object = deform_arm
+        self.rig.pose.bones["torso"].location = Vector((0.0, 0.0, 0.25))
+        bpy.context.view_layer.update()
+
+        vmd_bytes = self._build_vmd_bytes(
+            bone_keys=[],
+            morph_keys=[("まばたき", 0, 0.6)],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            vmd_path = Path(tmp) / "blink_only.vmd"
+            vmd_path.write_bytes(vmd_bytes)
+            st = set_settings(None, self.rig, "IK", "IK")
+            res = bpy.ops.posesnap.import_vmd(filepath=str(vmd_path), frame_offset=1, frame_step=1)
+            self.assertEqual(res, {"FINISHED"}, st.last_status)
+
+        bpy.context.scene.frame_set(1)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.06, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["torso"].location.z, 0.25, places=4)
+
+
 class TestUnregister(unittest.TestCase):
     def test_unregister_register_cycle(self):
         posesnap.unregister()
@@ -926,7 +1325,8 @@ class TestUnregister(unittest.TestCase):
 
 ORDERED_CASES = (
     TestStartupAndRegistration, TestHierarchyMapping, TestPoleAndCalibration, TestRetargetIK,
-    TestRetargetFK, TestBake, TestVpdParsing, TestVpdApply, TestUnregister,
+    TestRetargetFK, TestBake, TestVpdParsing, TestVpdApply, TestMorphRigIntegration,
+    TestVmdImport, TestUnregister,
 )
 
 
