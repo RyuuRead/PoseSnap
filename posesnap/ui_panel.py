@@ -298,17 +298,27 @@ class POSESNAP_OT_import_vpd(bpy.types.Operator):
 
 
 class POSESNAP_OT_import_vmd(bpy.types.Operator):
-    """Import a .vmd motion file directly onto Target MMR"""
+    """Import one or more .vmd motion files directly onto Target MMR"""
 
     bl_idname = "posesnap.import_vmd"
     bl_label = "Import .vmd Motion to MMR..."
-    bl_description = "Parse a Vocaloid Motion Data (.vmd) file and bake bone and facial keyframes directly onto Target MMR"
+    bl_description = "Select one or more .vmd files (e.g. body + face + lip) and merge their bone and facial keyframes onto Target MMR"
     bl_options = {"REGISTER", "UNDO"}
 
     filepath: bpy.props.StringProperty(
         name="VMD File Path",
-        description="Path to the .vmd motion file to import",
+        description="Path to a .vmd motion file to import",
         subtype="FILE_PATH",
+    )
+    directory: bpy.props.StringProperty(
+        name="Directory",
+        subtype="DIR_PATH",
+        options={"HIDDEN"},
+    )
+    files: bpy.props.CollectionProperty(
+        name="VMD Files",
+        type=bpy.types.OperatorFileListElement,
+        options={"HIDDEN", "SKIP_SAVE"},
     )
     filter_glob: bpy.props.StringProperty(
         default="*.vmd",
@@ -347,12 +357,25 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
             return False
         return _is_valid_armature(settings.target_rig) and _has_any_filter(settings)
 
+    def _resolve_filepaths(self) -> list[str]:
+        if self.files and self.directory:
+            paths = [
+                os.path.join(self.directory, item.name)
+                for item in self.files
+                if getattr(item, "name", "")
+            ]
+            if paths:
+                return paths
+        if self.filepath:
+            return [self.filepath]
+        return []
+
     def invoke(self, context: bpy.types.Context, event: bpy.types.Event) -> set[str]:
         scene = getattr(context, "scene", None)
         settings = getattr(scene, "posesnap", None) if scene is not None else None
         if settings is not None:
             self.frame_step = max(1, int(settings.frame_step))
-        if not self.filepath:
+        if not self._resolve_filepaths():
             context.window_manager.fileselect_add(self)
             return {"RUNNING_MODAL"}
         return self.execute(context)
@@ -373,7 +396,8 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
             self.report({"WARNING"}, msg)
             return {"CANCELLED"}
 
-        if not self.filepath:
+        filepaths = self._resolve_filepaths()
+        if not filepaths:
             msg = "No .vmd file path provided."
             settings.last_status = msg
             self.report({"ERROR"}, msg)
@@ -388,9 +412,9 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
         )
 
         try:
-            stats = vmd_parser.apply_vmd_to_mmr(
+            stats = vmd_parser.apply_vmds_to_mmr(
                 context,
-                self.filepath,
+                filepaths,
                 settings.target_rig,
                 options,
                 scale=vpd_scale,
@@ -413,9 +437,12 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
         frames_baked = int(stats.get("frames_baked", 0))
         bones_posed = int(stats.get("bones_posed", 0))
         morphs_total = int(stats.get("morphs_driven", 0)) + int(stats.get("morphs_direct", 0))
-        filename = os.path.basename(self.filepath)
         morph_note = f", {morphs_total} morphs" if morphs_total > 0 else ""
-        msg = f"Imported {filename} ({frames_baked} frames, {bones_posed} bones{morph_note}) to {settings.target_rig.name}."
+        if len(filepaths) == 1:
+            source_label = os.path.basename(filepaths[0])
+        else:
+            source_label = f"{len(filepaths)} .vmd files"
+        msg = f"Imported {source_label} ({frames_baked} frames, {bones_posed} bones{morph_note}) to {settings.target_rig.name}."
         settings.last_status = msg
         self.report({"INFO"}, msg)
         return {"FINISHED"}

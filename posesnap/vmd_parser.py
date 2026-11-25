@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from bisect import bisect_right
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import struct
@@ -213,6 +214,58 @@ def parse_vmd_file(filepath: str) -> VmdMotionData:
     return parse_vmd_bytes(path.read_bytes(), filepath=str(path))
 
 
+def merge_vmd_motions(motions: Sequence[VmdMotionData]) -> VmdMotionData:
+    """Merge multiple parsed VMD motions into one combined bone and morph dataset."""
+    if not motions:
+        raise ValueError("At least one VMD motion is required.")
+    if len(motions) == 1:
+        return motions[0]
+
+    bone_maps: dict[str, dict[int, VmdBoneKey]] = {}
+    morph_maps: dict[str, dict[int, VmdMorphKey]] = {}
+    frame_min: int | None = None
+    frame_max: int | None = None
+
+    for motion in motions:
+        for bname, keys in motion.bones.items():
+            track = bone_maps.setdefault(bname, {})
+            for key in keys:
+                track[key.frame] = key
+                if frame_min is None or key.frame < frame_min:
+                    frame_min = key.frame
+                if frame_max is None or key.frame > frame_max:
+                    frame_max = key.frame
+        for mname, keys in motion.morphs.items():
+            track = morph_maps.setdefault(mname, {})
+            for key in keys:
+                track[key.frame] = key
+                if frame_min is None or key.frame < frame_min:
+                    frame_min = key.frame
+                if frame_max is None or key.frame > frame_max:
+                    frame_max = key.frame
+
+    bones = {
+        name: [fmap[f] for f in sorted(fmap)]
+        for name, fmap in bone_maps.items()
+    }
+    morphs = {
+        name: [fmap[f] for f in sorted(fmap)]
+        for name, fmap in morph_maps.items()
+    }
+
+    return VmdMotionData(
+        filepath=motions[0].filepath,
+        version=max(m.version for m in motions),
+        model_name=next((m.model_name for m in motions if m.model_name), ""),
+        bones=bones,
+        morphs=morphs,
+        bone_key_count=sum(len(v) for v in bones.values()),
+        morph_key_count=sum(len(v) for v in morphs.values()),
+        frame_min=frame_min if frame_min is not None else 0,
+        frame_max=frame_max if frame_max is not None else 0,
+    )
+
+
 def _sample_bone_track(
     keys: list[VmdBoneKey],
     frames: list[int],
@@ -317,9 +370,9 @@ def sample_vmd_frame_as_vpd(
     )
 
 
-def apply_vmd_to_mmr(
+def apply_vmds_to_mmr(
     context: Any,
-    filepath: str,
+    filepaths: Sequence[str],
     target_rig: Any,
     options: RetargetOptions | None = None,
     scale: float = 0.08,
@@ -330,8 +383,12 @@ def apply_vmd_to_mmr(
     set_timeline_range: bool = False,
     bake_all_frames: bool = False,
 ) -> dict[str, int]:
-    """Parse a .vmd motion file and import bone and facial keyframes onto Target MMR."""
-    vmd_data = parse_vmd_file(filepath)
+    """Parse and merge one or more .vmd files and import keyframes onto Target MMR."""
+    paths = [str(p) for p in filepaths if p]
+    if not paths:
+        raise ValueError("No .vmd file paths provided.")
+
+    vmd_data = merge_vmd_motions([parse_vmd_file(p) for p in paths])
     if not vmd_data.bones and not vmd_data.morphs:
         raise ValueError("VMD file contains no bone or morph keyframes.")
 
@@ -452,8 +509,38 @@ def apply_vmd_to_mmr(
 
     return {
         **last_stats,
+        "files_merged": len(paths),
         "frames_baked": frames_baked,
         "bones_posed": last_stats.get("total", 0),
         "frame_start": start + offset,
         "frame_end": end + offset,
     }
+
+
+def apply_vmd_to_mmr(
+    context: Any,
+    filepath: str,
+    target_rig: Any,
+    options: RetargetOptions | None = None,
+    scale: float = 0.08,
+    frame_offset: int = 1,
+    frame_step: int = 1,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
+    set_timeline_range: bool = False,
+    bake_all_frames: bool = False,
+) -> dict[str, int]:
+    """Parse a single .vmd motion file and import bone and facial keyframes onto Target MMR."""
+    return apply_vmds_to_mmr(
+        context,
+        [filepath],
+        target_rig,
+        options=options,
+        scale=scale,
+        frame_offset=frame_offset,
+        frame_step=frame_step,
+        frame_start=frame_start,
+        frame_end=frame_end,
+        set_timeline_range=set_timeline_range,
+        bake_all_frames=bake_all_frames,
+    )

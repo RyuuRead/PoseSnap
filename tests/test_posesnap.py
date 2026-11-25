@@ -1313,6 +1313,66 @@ class TestVmdImport(unittest.TestCase):
         self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.06, places=4)
         self.assertAlmostEqual(self.rig.pose.bones["torso"].location.z, 0.25, places=4)
 
+    def test_vmd_multi_file_merge_body_and_morph(self):
+        q_id = (0.0, 0.0, 0.0, 1.0)
+        q_arm = (0.0, 0.0, math.sin(math.radians(25)), math.cos(math.radians(25)))
+        body_vmd = self._build_vmd_bytes(
+            bone_keys=[
+                ("センター", 0, (0.0, 0.0, 0.0), q_id),
+                ("センター", 4, (0.0, 3.0, 0.0), q_id),
+                ("左腕", 0, (0.0, 0.0, 0.0), q_id),
+                ("左腕", 4, (0.0, 0.0, 0.0), q_arm),
+            ],
+            morph_keys=[],
+        )
+        face_vmd = self._build_vmd_bytes(
+            bone_keys=[],
+            morph_keys=[
+                ("まばたき", 0, 0.0),
+                ("まばたき", 6, 1.0),
+                ("い", 0, 0.0),
+                ("い", 6, 0.5),
+            ],
+        )
+        lip_vmd = self._build_vmd_bytes(
+            bone_keys=[],
+            morph_keys=[
+                ("お", 0, 0.0),
+                ("お", 6, 0.75),
+                ("ウィンク", 0, 0.0),
+                ("ウィンク", 6, 0.4),
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "body.vmd").write_bytes(body_vmd)
+            (Path(tmp) / "face.vmd").write_bytes(face_vmd)
+            (Path(tmp) / "lip.vmd").write_bytes(lip_vmd)
+            st = set_settings(None, self.rig, "FK", "IK")
+            res = bpy.ops.posesnap.import_vmd(
+                directory=tmp,
+                files=[{"name": "body.vmd"}, {"name": "face.vmd"}, {"name": "lip.vmd"}],
+                frame_offset=1,
+                set_timeline_range=True,
+            )
+            self.assertEqual(res, {"FINISHED"}, st.last_status)
+            self.assertIn("3 .vmd files", st.last_status)
+
+        self.assertEqual(bpy.context.scene.frame_start, 1)
+        self.assertEqual(bpy.context.scene.frame_end, 7)
+
+        bpy.context.scene.frame_set(7)
+        bpy.context.view_layer.update()
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Blink"].location.y, 0.10, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.x, 0.02, places=4)
+        self.assertAlmostEqual(self.rig.pose.bones["Fader_Vowel_UIEO"].location.y, 0.03, places=4)
+        self.assertAlmostEqual(self.face_mesh.data.shape_keys.key_blocks["ウィンク"].value, 0.4, places=4)
+
+        action = self.rig.animation_data.action
+        fcurves = compat.get_action_fcurves(action, getattr(self.rig.animation_data, "action_slot", None))
+        blink_fc = next(fc for fc in fcurves if fc.data_path == 'pose.bones["Fader_Blink"].location' and fc.array_index == 1)
+        self.assertEqual([int(round(kp.co.x)) for kp in blink_fc.keyframe_points], [1, 7])
+
 
 class TestUnregister(unittest.TestCase):
     def test_unregister_register_cycle(self):
