@@ -301,15 +301,18 @@ def _solve_two_bone_leg_ik_in_place(
         return
 
     knee_vpd = _find_vpd_entry(vpd_data, knee_name)
-    if knee_vpd is not None and knee_vpd.rotation_bl.angle > 1e-2:
-        # Respect explicit FK knee rotations when the VPD already poses the knee directly.
-        return
-
     ik_vpd = _find_vpd_entry(vpd_data, ik_name)
     groove_vpd = _find_vpd_entry(vpd_data, "グルーブ")
     center_vpd = _find_vpd_entry(vpd_data, "センター")
+    ik_has_direct_target = ik_vpd is not None and (
+        ik_vpd.location_bl.length > 1e-5 or ik_vpd.rotation_bl.angle > 1e-4
+    )
+    if not ik_has_direct_target and knee_vpd is not None and knee_vpd.rotation_bl.angle > 0.15:
+        # Respect explicit FK knee rotations only when no IK target drives the foot.
+        return
+
     has_ik_offset = (
-        (ik_vpd is not None and (ik_vpd.location_bl.length > 1e-5 or ik_vpd.rotation_bl.angle > 1e-4))
+        ik_has_direct_target
         or (groove_vpd is not None and groove_vpd.location_bl.length > 1e-5)
         or (center_vpd is not None and center_vpd.location_bl.length > 1e-5)
     )

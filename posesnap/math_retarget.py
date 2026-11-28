@@ -108,26 +108,35 @@ def compute_ik_pole_world(
     else:
         p_proj = a.copy()
 
-    d_bend = b - p_proj
-    if d_bend.length >= 1e-4:
-        bend_dir = d_bend.normalized()
+    if fallback_dir is not None and Vector(fallback_dir).length > 1e-6:
+        raw_dir = Vector(fallback_dir).normalized()
     else:
-        if fallback_dir is not None and Vector(fallback_dir).length > 1e-6:
-            raw_dir = Vector(fallback_dir).normalized()
-        else:
-            # MMD and MMR models face -Y in Blender, so knees bend toward -Y and elbows toward +Y.
-            kind = (limb_kind or "ARM").upper()
-            raw_dir = Vector((0.0, 1.0, 0.0)) if kind == "ARM" else Vector((0.0, -1.0, 0.0))
+        # MMD and MMR models face -Y in Blender, so knees bend toward -Y and elbows toward +Y.
+        kind = (limb_kind or "ARM").upper()
+        raw_dir = Vector((0.0, 1.0, 0.0)) if kind == "ARM" else Vector((0.0, -1.0, 0.0))
 
-        if ac_len > 1e-6:
-            ac_unit = ac / ac_len
-            ortho = raw_dir - ac_unit * raw_dir.dot(ac_unit)
-            if ortho.length < 1e-6:
-                alt = Vector((1.0, 0.0, 0.0)) if abs(ac_unit.x) < 0.9 else Vector((0.0, 0.0, 1.0))
-                ortho = alt - ac_unit * alt.dot(ac_unit)
-            bend_dir = ortho.normalized()
-        else:
-            bend_dir = raw_dir.normalized()
+    if ac_len > 1e-6:
+        ac_unit = ac / ac_len
+        ortho = raw_dir - ac_unit * raw_dir.dot(ac_unit)
+        if ortho.length < 1e-6:
+            alt = Vector((1.0, 0.0, 0.0)) if abs(ac_unit.x) < 0.9 else Vector((0.0, 0.0, 1.0))
+            ortho = alt - ac_unit * alt.dot(ac_unit)
+        safe_fallback = ortho.normalized()
+    else:
+        safe_fallback = raw_dir.normalized()
+
+    d_bend = b - p_proj
+    bend_len = d_bend.length
+    # Smoothly blend toward the anatomical fallback when the limb is nearly straight to prevent pole snaps.
+    blend_threshold = 0.015
+    if bend_len >= blend_threshold:
+        bend_dir = d_bend / bend_len
+    elif bend_len >= 1e-4:
+        alpha = bend_len / blend_threshold
+        blended = safe_fallback * (1.0 - alpha) + (d_bend / bend_len) * alpha
+        bend_dir = blended.normalized() if blended.length > 1e-6 else safe_fallback
+    else:
+        bend_dir = safe_fallback
 
     dist = pole_factor * ac_len if ac_len >= 1e-4 else max(pole_factor * ab.length * 2.0, 0.15)
     return b + bend_dir * dist
@@ -253,12 +262,15 @@ def _assign_pose_bone_basis_rotation(pbone: Any, r_basis: Matrix) -> None:
     q = r_basis.to_quaternion().normalized()
     mode = getattr(pbone, "rotation_mode", "QUATERNION")
     if mode == "QUATERNION":
+        prev_q = Quaternion(pbone.rotation_quaternion)
+        if prev_q.magnitude > 1e-6 and q.dot(prev_q) < 0.0:
+            q = -q
         pbone.rotation_quaternion = q
     elif mode == "AXIS_ANGLE":
         axis, angle = q.to_axis_angle()
         pbone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
     else:
-        pbone.rotation_euler = r_basis.to_euler(mode)
+        pbone.rotation_euler = r_basis.to_euler(mode, pbone.rotation_euler)
 
 
 def _apply_world_transform_to_bone(

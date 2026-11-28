@@ -348,6 +348,11 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
         description="Keyframe every frame instead of preserving only original VMD keyframes",
         default=False,
     )
+    auto_cleanup: bpy.props.BoolProperty(
+        name="Automatic Cleanup",
+        description="Fix quaternion or Euler flips, IK pole spikes, Bezier overshoot, and redundant keyframes after import",
+        default=True,
+    )
 
     @classmethod
     def poll(cls, context: bpy.types.Context) -> bool:
@@ -375,6 +380,7 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
         settings = getattr(scene, "posesnap", None) if scene is not None else None
         if settings is not None:
             self.frame_step = max(1, int(settings.frame_step))
+            self.auto_cleanup = bool(getattr(settings, "auto_cleanup_vmd", True))
         if not self._resolve_filepaths():
             context.window_manager.fileselect_add(self)
             return {"RUNNING_MODAL"}
@@ -422,6 +428,7 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
                 frame_step=int(self.frame_step),
                 set_timeline_range=bool(self.set_timeline_range),
                 bake_all_frames=bool(self.bake_all_frames),
+                auto_cleanup=bool(self.auto_cleanup),
             )
         except OSError as exc:
             msg = f"Failed to read .vmd file: {exc}"
@@ -443,6 +450,49 @@ class POSESNAP_OT_import_vmd(bpy.types.Operator):
         else:
             source_label = f"{len(filepaths)} .vmd files"
         msg = f"Imported {source_label} ({frames_baked} frames, {bones_posed} bones{morph_note}) to {settings.target_rig.name}."
+        settings.last_status = msg
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class POSESNAP_OT_cleanup_motion(bpy.types.Operator):
+    """Automatically clean up quaternion flips, IK spikes, and overshoot on Target MMR"""
+
+    bl_idname = "posesnap.cleanup_motion"
+    bl_label = "Automatic Cleanup Motion"
+    bl_description = "Fix quaternion or Euler flips, IK pole spikes, Bezier overshoot, and redundant keyframes on Target MMR"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        scene = getattr(context, "scene", None) if context is not None else None
+        settings = getattr(scene, "posesnap", None) if scene is not None else None
+        if settings is None or not _is_valid_armature(settings.target_rig):
+            return False
+        anim_data = getattr(settings.target_rig, "animation_data", None)
+        return getattr(anim_data, "action", None) is not None
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        from . import motion_cleanup
+
+        settings = context.scene.posesnap
+        if not _is_valid_armature(settings.target_rig):
+            msg = "Select a Target MMR rig before running cleanup."
+            settings.last_status = msg
+            self.report({"ERROR"}, msg)
+            return {"CANCELLED"}
+
+        stats = motion_cleanup.cleanup_rig_action(settings.target_rig)
+        if hasattr(context, "view_layer"):
+            context.view_layer.update()
+
+        msg = (
+            f"Cleaned {settings.target_rig.name}: "
+            f"{stats['quat_flips']} quat flips, "
+            f"{stats['euler_flips']} Euler flips, "
+            f"{stats['ik_spikes']} IK spikes, "
+            f"{stats['keys_removed']} redundant keys removed."
+        )
         settings.last_status = msg
         self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -672,9 +722,17 @@ class POSESNAP_PT_main(bpy.types.Panel):
 
         vmd_col = box4.column(align=True)
         vmd_col.enabled = has_tgt and any_filter
+        vmd_col.prop(settings, "auto_cleanup_vmd")
         vmd_col.operator(
             "posesnap.import_vmd",
             icon=compat.safe_icon("IMPORT", "FILE_FOLDER"),
+        )
+        has_action = has_tgt and getattr(getattr(tgt, "animation_data", None), "action", None) is not None
+        cleanup_col = box4.column(align=True)
+        cleanup_col.enabled = has_action
+        cleanup_col.operator(
+            "posesnap.cleanup_motion",
+            icon=compat.safe_icon("BRUSH_DATA", "MOD_SMOOTH"),
         )
         if not has_tgt:
             box4.label(
@@ -696,6 +754,7 @@ CLASSES = (
     POSESNAP_OT_snap_pose,
     POSESNAP_OT_import_vpd,
     POSESNAP_OT_import_vmd,
+    POSESNAP_OT_cleanup_motion,
     POSESNAP_OT_bake_animation,
     POSESNAP_PT_main,
 )

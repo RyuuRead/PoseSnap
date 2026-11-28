@@ -10,8 +10,8 @@ from . import compat, ui_panel
 bl_info = {
     "name": "PoseSnap",
     "author": "RyuuRead",
-    "version": (1, 0, 0),
-    "blender": (4, 4, 0),
+    "version": (0, 1, 0),
+    "blender": (4, 2, 0),
     "location": "View3D > Sidebar > PoseSnap / MMR",
     "description": "MMD (.vpd/.vmd) pose and animation retargeter to MikuMikuRig IK/FK controllers",
     "category": "Animation",
@@ -164,6 +164,11 @@ class PoseSnapSettings(bpy.types.PropertyGroup):
         default=1,
         min=1,
         max=10,
+    )
+    auto_cleanup_vmd: bpy.props.BoolProperty(
+        name="Automatic Cleanup on VMD Import",
+        description="Automatically fix quaternion or Euler flips, IK pole spikes, Bezier overshoot, and redundant keyframes after VMD import",
+        default=True,
     )
     last_status: bpy.props.StringProperty(
         name="Last Status",

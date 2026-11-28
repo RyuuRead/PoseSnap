@@ -490,10 +490,11 @@ class TestStartupAndRegistration(unittest.TestCase):
         self.assertTrue(hasattr(bpy.types, "POSESNAP_PT_main"))
         for op in ("POSESNAP_OT_auto_detect_rigs", "POSESNAP_OT_auto_calibrate_height",
                    "POSESNAP_OT_snap_pose", "POSESNAP_OT_import_vpd",
-                   "POSESNAP_OT_import_vmd", "POSESNAP_OT_bake_animation"):
+                   "POSESNAP_OT_import_vmd", "POSESNAP_OT_cleanup_motion",
+                   "POSESNAP_OT_bake_animation"):
             self.assertTrue(hasattr(bpy.types, op), op)
         for idname in ("auto_detect_rigs", "auto_calibrate_height", "snap_pose", "import_vpd",
-                       "import_vmd", "bake_animation"):
+                       "import_vmd", "cleanup_motion", "bake_animation"):
             getattr(bpy.ops.posesnap, idname).get_rna_type()
         self.assertTrue(hasattr(bpy.types.Scene, "posesnap"))
         self.assertEqual(bpy.context.scene.posesnap.arms_mode, "IK")
@@ -1374,6 +1375,154 @@ class TestVmdImport(unittest.TestCase):
         self.assertEqual([int(round(kp.co.x)) for kp in blink_fc.keyframe_points], [1, 7])
 
 
+class TestMotionCleanup(unittest.TestCase):
+    def setUp(self):
+        clear_scene_objects()
+        self.rig = build_mmr_rig("RIG-MMR-CleanupTest")
+        bpy.context.view_layer.update()
+
+    def tearDown(self):
+        clear_scene_objects()
+
+    def test_cleanup_fixes_quat_flip_ik_spike_and_redundant_keys(self):
+        pole_pb = self.rig.pose.bones["thigh_ik_target.L"]
+        foot_pb = self.rig.pose.bones["foot_ik.L"]
+        torso_pb = self.rig.pose.bones["torso"]
+
+        # Pole location: frame 3 has a +0.60 m single-frame flip spike; frames 4..5 are flat.
+        for frame, y_val in ((1, -0.35), (2, -0.35), (3, 0.25), (4, -0.35), (5, -0.35)):
+            pole_pb.location = Vector((0.0, y_val, 0.0))
+            compat.insert_pose_keyframes(pole_pb, frame=frame, do_loc=True, do_rot=False)
+
+        # Quaternion rotation: frame 2 is negated (-q) to simulate a 360-degree flip.
+        q_base = Quaternion((0.92, 0.25, 0.15, 0.24)).normalized()
+        for frame, q_val in ((1, q_base), (2, -q_base), (3, q_base)):
+            foot_pb.rotation_quaternion = q_val
+            compat.insert_pose_keyframes(foot_pb, frame=frame, do_loc=False, do_rot=True)
+
+        # Flat redundant intermediate keyframe on torso location.
+        for frame in (1, 2, 3):
+            torso_pb.location = Vector((0.0, 0.0, 0.10))
+            compat.insert_pose_keyframes(torso_pb, frame=frame, do_loc=True, do_rot=False)
+
+        st = set_settings(None, self.rig, "IK", "IK")
+        res = bpy.ops.posesnap.cleanup_motion()
+        self.assertEqual(res, {"FINISHED"}, st.last_status)
+        self.assertIn("quat flips", st.last_status)
+
+        action = self.rig.animation_data.action
+        fcurves = compat.get_action_fcurves(action, getattr(self.rig.animation_data, "action_slot", None))
+
+        # Verify quaternion continuity (all consecutive dot products >= 0).
+        q_fcurves = {
+            fc.array_index: fc
+            for fc in fcurves
+            if fc.data_path == 'pose.bones["foot_ik.L"].rotation_quaternion'
+        }
+        self.assertEqual(len(q_fcurves), 4)
+        q_frames = sorted({round(kp.co.x, 3) for kp in q_fcurves[0].keyframe_points})
+        quats = [
+            tuple(
+                next(kp.co.y for kp in q_fcurves[i].keyframe_points if round(kp.co.x, 3) == f)
+                for i in range(4)
+            )
+            for f in q_frames
+        ]
+        for a, b in zip(quats, quats[1:]):
+            self.assertGreaterEqual(sum(x * y for x, y in zip(a, b)), 0.0)
+
+        # Verify IK pole spike keyframe was deleted and Bezier handles are AUTO_CLAMPED.
+        pole_y_fc = next(
+            fc for fc in fcurves
+            if fc.data_path == 'pose.bones["thigh_ik_target.L"].location' and fc.array_index == 1
+        )
+        self.assertNotIn(3, [int(round(kp.co.x)) for kp in pole_y_fc.keyframe_points])
+        self.assertAlmostEqual(pole_y_fc.evaluate(3.0), -0.35, places=3)
+        for kp in pole_y_fc.keyframe_points:
+            self.assertAlmostEqual(kp.co.y, -0.35, places=3)
+            if kp.interpolation == "BEZIER":
+                self.assertEqual(kp.handle_left_type, "AUTO_CLAMPED")
+                self.assertEqual(kp.handle_right_type, "AUTO_CLAMPED")
+
+        # Verify redundant flat keyframe on torso was removed.
+        torso_z_fc = next(
+            fc for fc in fcurves
+            if fc.data_path == 'pose.bones["torso"].location' and fc.array_index == 2
+        )
+        self.assertEqual(len(torso_z_fc.keyframe_points), 2)
+
+    def test_cleanup_deletes_quaternion_z_spike_and_plateau_spikes(self):
+        foot_pb = self.rig.pose.bones["foot_ik.R"]
+
+        # Smooth quaternion curve across frames 75..95 with a fatal 1-frame Z spike at frame 81
+        # and a 4-frame rectangular X-location plateau spike at frames 86..89.
+        for frame in range(75, 96):
+            if frame == 81:
+                q_val = Quaternion((0.35, 0.10, 0.15, 0.95)).normalized()
+            else:
+                q_val = Quaternion((0.55, -0.10, 0.20, -0.80)).normalized()
+
+            x_loc = 0.95 if 86 <= frame <= 89 else 0.0
+            foot_pb.location = Vector((x_loc, 0.0, 0.0))
+            foot_pb.rotation_quaternion = q_val
+            compat.insert_pose_keyframes(foot_pb, frame=frame, do_loc=True, do_rot=True)
+
+        st = set_settings(None, self.rig, "IK", "IK")
+        res = bpy.ops.posesnap.cleanup_motion()
+        self.assertEqual(res, {"FINISHED"}, st.last_status)
+
+        action = self.rig.animation_data.action
+        fcurves = compat.get_action_fcurves(action, getattr(self.rig.animation_data, "action_slot", None))
+
+        q_z_fc = next(
+            fc for fc in fcurves
+            if fc.data_path == 'pose.bones["foot_ik.R"].rotation_quaternion' and fc.array_index == 3
+        )
+        self.assertNotIn(81, [int(round(kp.co.x)) for kp in q_z_fc.keyframe_points])
+        self.assertLess(q_z_fc.evaluate(81.0), -0.5)
+
+        x_loc_fc = next(
+            fc for fc in fcurves
+            if fc.data_path == 'pose.bones["foot_ik.R"].location' and fc.array_index == 0
+        )
+        x_frames = [int(round(kp.co.x)) for kp in x_loc_fc.keyframe_points]
+        for glitch_frame in (86, 87, 88, 89):
+            self.assertNotIn(glitch_frame, x_frames)
+        self.assertAlmostEqual(x_loc_fc.evaluate(87.0), 0.0, places=3)
+
+    def test_vmd_import_with_auto_cleanup_enabled(self):
+        q_id = (0.0, 0.0, 0.0, 1.0)
+        q_leg = (math.sin(math.radians(15)), 0.0, 0.0, math.cos(math.radians(15)))
+        vmd_bytes = TestVmdImport._build_vmd_bytes(
+            bone_keys=[
+                ("センター", 0, (0.0, 0.0, 0.0), q_id),
+                ("センター", 4, (0.0, 1.5, 0.0), q_id),
+                ("左足", 0, (0.0, 0.0, 0.0), q_id),
+                ("左足", 4, (0.0, 0.0, 0.0), q_leg),
+            ],
+            morph_keys=[],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            vmd_path = Path(tmp) / "cleanup_test.vmd"
+            vmd_path.write_bytes(vmd_bytes)
+            st = set_settings(None, self.rig, "IK", "IK")
+            res = bpy.ops.posesnap.import_vmd(
+                filepath=str(vmd_path),
+                frame_offset=1,
+                auto_cleanup=True,
+            )
+            self.assertEqual(res, {"FINISHED"}, st.last_status)
+
+        action = self.rig.animation_data.action
+        fcurves = compat.get_action_fcurves(action, getattr(self.rig.animation_data, "action_slot", None))
+        for fc in fcurves:
+            if fc.data_path.startswith("pose.bones["):
+                for kp in fc.keyframe_points:
+                    if kp.interpolation == "BEZIER":
+                        self.assertEqual(kp.handle_left_type, "AUTO_CLAMPED")
+                        self.assertEqual(kp.handle_right_type, "AUTO_CLAMPED")
+
+
 class TestUnregister(unittest.TestCase):
     def test_unregister_register_cycle(self):
         posesnap.unregister()
@@ -1386,7 +1535,7 @@ class TestUnregister(unittest.TestCase):
 ORDERED_CASES = (
     TestStartupAndRegistration, TestHierarchyMapping, TestPoleAndCalibration, TestRetargetIK,
     TestRetargetFK, TestBake, TestVpdParsing, TestVpdApply, TestMorphRigIntegration,
-    TestVmdImport, TestUnregister,
+    TestVmdImport, TestMotionCleanup, TestUnregister,
 )
 
 
